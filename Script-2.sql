@@ -14,14 +14,8 @@
 Анализ требуется провести за 2024 год.
 */
 
-with valid_tranches as (
-    select *
-    from tranches
-    where operation_datetime >= date '2024-01-01'
-      and operation_datetime <  date '2025-01-01'
-),
-matched_tx as (
-    -- первичное соединение в рамках окна t+10 дней
+with matched_tx as (
+    -- 1. Фильтруем транши и собираем все потенциальные транзакции в окне t+10 дней
     select
         tr.doc_id as tranche_doc_id,
         tr.operation_sum as tranche_sum,
@@ -31,71 +25,58 @@ matched_tx as (
         tx.operation_datetime as tx_dt,
         tx.ctrg_inn,
         tx.ctrg_account
-    from valid_tranches tr
+    from tranches tr
     join transactions tx
       on tx.inn::text = tr.inn
      and tx.account = tr.account
-     and tx.operation_datetime between tr.operation_datetime
+     and tx.operation_datetime between tr.operation_datetime 
                                    and tr.operation_datetime + interval '10 days'
+    where tr.operation_datetime >= date '2024-01-01'
+      and tr.operation_datetime <  date '2025-01-01'
 ),
 rule1_matches as (
-    -- правило 1: ищем точное совпадение. 
-    -- если их несколько, детерминированно берем первую по времени.
+    -- 2. правило 1: ищем точное совпадение
     select distinct on (tranche_doc_id)
-           tranche_doc_id,
-           tx_doc_id
+        tranche_doc_id,
+        tranche_sum,
+        'rule 1' as match_rule,
+        tx_doc_id,
+        tx_dt,
+        tx_sum,
+        ctrg_inn,
+        ctrg_account
     from matched_tx
     where tx_sum = tranche_sum
     order by tranche_doc_id, tx_dt, tx_doc_id
 ),
-rule2_pool as (
-    -- отсеиваем транши, которые уже закрыты по правилу 1
-    select m.*
-    from matched_tx m
-    left join rule1_matches r1
-           on m.tranche_doc_id = r1.tranche_doc_id
-    where r1.tranche_doc_id is null
-),
 rule2_filtered as (
-    -- правило 2: считаем сумму предыдущих транзакций и останавливаемся при превышении
-    select *
+    -- 3. правило 2: считаем сумму с накоплением только для тех, кто не попал в правило 1
+    select
+        tranche_doc_id,
+        tranche_sum,
+        'rule 2' as match_rule,
+        tx_doc_id,
+        tx_dt,
+        tx_sum,
+        ctrg_inn,
+        ctrg_account
     from (
         select
-            rt.*,
-            coalesce(
-                sum(tx_sum) over (
-                    partition by tranche_doc_id
-                    order by tx_dt, tx_doc_id
-                    rows between unbounded preceding and 1 preceding
-                ),
-                0
-            ) as prev_running_sum
-        from rule2_pool rt
+            m.*,
+            coalesce(sum(m.tx_sum) over (
+                partition by m.tranche_doc_id
+                order by m.tx_dt, m.tx_doc_id
+                rows between unbounded preceding and 1 preceding
+            ), 0) as prev_running_sum
+        from matched_tx m
+        where not exists (
+            select 1 from rule1_matches r1 where r1.tranche_doc_id = m.tranche_doc_id
+        )
     ) s
     where prev_running_sum < tranche_sum
 )
-select
-    m.tranche_doc_id,
-    m.tranche_sum,
-    'rule 1' as match_rule,
-    m.tx_doc_id,
-    m.tx_dt,
-    m.tx_sum,
-    m.ctrg_inn,
-    m.ctrg_account
-from matched_tx m
-join rule1_matches r1
-  on m.tranche_doc_id = r1.tranche_doc_id
- and m.tx_doc_id = r1.tx_doc_id
+-- 4. итоговое объединение
+select * from rule1_matches
 union all
-select
-    tranche_doc_id,
-    tranche_sum,
-    'rule 2' as match_rule,
-    tx_doc_id,
-    tx_dt,
-    tx_sum,
-    ctrg_inn,
-    ctrg_account
-from rule2_filtered
+select * from rule2_filtered
 order by tranche_doc_id, tx_dt, tx_doc_id;
